@@ -1,0 +1,1644 @@
+diff -rupN p3dfft-2.4-orig//build/cuda.cu p3dfft-2.4//build/cuda.cu
+--- p3dfft-2.4-orig//build/cuda.cu	1969-12-31 19:00:00.000000000 -0500
++++ p3dfft-2.4//build/cuda.cu	2011-04-09 20:36:30.000000000 -0400
+@@ -0,0 +1,187 @@
++#include <stdio.h>
++#include <cufft.h>
++#include <cutil.h>
++
++
++/* variables */
++int GPUID = 0;
++int _INIT = 0;
++size_t currSizeR = 0;
++size_t currSizeC = 0;
++cufftReal* d_rsignal = NULL;
++cufftComplex* d_csignal = NULL;
++int BATCHC2C = 1; //The number of batched ffts
++int BATCHR2C = 1;
++int BATCHC2R = 1;
++int gprocid = 0;
++
++
++/* errors */
++static  char *errStr[9]= {
++                "CUFFT_SUCCESS",
++                "CUFFT_INVALID_PLAN",
++                "CUFFT_ALLOC_FAILED",
++                "CUFFT_INVALID_TYPE",
++                "CUFFT_INVALID_VALUE",
++                "CUFFT_INTERNAL_ERROR",
++                "CUFFT_EXEC_FAILED",
++                "CUFFT_SETUP_FAILED",
++                "CUFFT_INVALID_SIZE"
++};
++#define MSG(msg,...) do {                                   \
++	        fprintf(stdout,__FILE__":%d(%s) " msg "\n",     \
++	                __LINE__, __FUNCTION__, ##__VA_ARGS__); \
++	        fflush(stdout);                                 \
++	    } while (0)
++#define CUFFT_SAFE_CALL_2( call) {                                           \
++    cufftResult err = call;                                                  \
++    if( CUFFT_SUCCESS != err) {                                              \
++        fprintf(stderr, "CUFFT error in file '%s' in line %i. - err: %s\n",  \
++                __FILE__, __LINE__, errStr[err]);                            \
++        MSG("...node,%d,gpu,%d",gprocid,GPUID);                              \
++        exit(EXIT_FAILURE);                                                  \
++    } cudaThreadSynchronize();                                               \
++  }
++#define CUDA_SAFE_CALL_2( call) {                                            \
++    cudaError err = call;                                                    \
++    if( cudaSuccess != err) {                                                \
++        fprintf(stderr, "CUDA error in file '%s' in line %i : %s.\n",        \
++                __FILE__, __LINE__, cudaGetErrorString( err) );              \
++        MSG("...node,%d,gpu,%d",gprocid,GPUID);                              \
++        exit(EXIT_FAILURE);                                                  \
++    } cudaThreadSynchronize();                                               \
++  }
++
++
++/* multi gpu */
++extern "C" void cuda_set_device_(int* proc_id) {
++	if (_INIT) { return; }
++	else {
++		int devcount;
++   		_INIT = 1;
++		cudaGetDeviceCount(&devcount);
++		GPUID = *proc_id % devcount;
++        gprocid = *proc_id;
++		CUDA_SAFE_CALL_2(cudaSetDevice(GPUID));
++	}
++}
++
++
++/* C2C */
++extern "C" void cuda_plan_c2c_1d_(cufftHandle* plan, int* dim, int* batch) {
++	BATCHC2C = *batch;
++	CUFFT_SAFE_CALL_2(cufftPlan1d(plan, *dim, CUFFT_C2C, *batch));
++}
++extern "C" void cuda_plan_c2c_1d_hack_(cufftHandle* plan, int* dim, int* batch) {
++    //    MSG("gpu,%d,c2cplan-hack,%x,dim,%d,batch,%d",GPUID,plan,*dim,*batch);
++    (cufftPlan1d(plan, *dim, CUFFT_C2C, *batch));
++}
++extern "C" void run_fft_c2c_for_(cufftHandle* plan, cufftComplex* a, cufftComplex* b, int* Np) {
++	int N = *Np;
++	size_t newSizeC = sizeof(cufftComplex) * N * BATCHC2C;
++   	if (newSizeC != currSizeC) {
++        currSizeC = newSizeC;
++		if (d_csignal) { CUDA_SAFE_CALL_2(cudaFree(d_csignal)); }
++		CUDA_SAFE_CALL_2(cudaMalloc((void**)&d_csignal, currSizeC));
++		CUDA_SAFE_CALL_2(cudaMemcpy(d_csignal, a, currSizeC, cudaMemcpyHostToDevice));
++		//fft
++		CUFFT_SAFE_CALL_2(cufftExecC2C(*plan, (cufftComplex*)d_csignal, (cufftComplex*)d_csignal, CUFFT_FORWARD));
++		CUDA_SAFE_CALL_2(cudaMemcpy(b, d_csignal, currSizeC, cudaMemcpyDeviceToHost));
++	} else {
++		CUDA_SAFE_CALL_2(cudaMemcpy(d_csignal, a, currSizeC, cudaMemcpyHostToDevice));
++		//fft
++		CUFFT_SAFE_CALL_2(cufftExecC2C(*plan, (cufftComplex*)d_csignal, (cufftComplex*)d_csignal, CUFFT_FORWARD));
++		CUDA_SAFE_CALL_2(cudaMemcpy(b, d_csignal, currSizeC, cudaMemcpyDeviceToHost));
++	}
++}
++extern "C" void run_fft_c2c_back_(cufftHandle* plan, cufftComplex* a, cufftComplex* b, int* Np) {
++	int N = *Np;
++	size_t newSizeC = sizeof(cufftComplex) * N * BATCHC2C;
++	if (newSizeC != currSizeC) {
++		currSizeC = newSizeC;
++		if (d_csignal) { CUDA_SAFE_CALL_2(cudaFree(d_csignal)); }
++		CUDA_SAFE_CALL_2(cudaMalloc((void**)&d_csignal, currSizeC));
++		CUDA_SAFE_CALL_2(cudaMemcpy(d_csignal, a, currSizeC, cudaMemcpyHostToDevice));
++		//fft
++		CUFFT_SAFE_CALL_2(cufftExecC2C(*plan, (cufftComplex*)d_csignal, (cufftComplex*)d_csignal, CUFFT_INVERSE));
++		CUDA_SAFE_CALL_2(cudaMemcpy(b, d_csignal, currSizeC, cudaMemcpyDeviceToHost));
++	} else {
++		CUDA_SAFE_CALL_2(cudaMemcpy(d_csignal, a, currSizeC, cudaMemcpyHostToDevice));
++		//fft
++		CUFFT_SAFE_CALL_2(cufftExecC2C(*plan, (cufftComplex*)d_csignal, (cufftComplex*)d_csignal, CUFFT_INVERSE));
++		CUDA_SAFE_CALL_2(cudaMemcpy(b, d_csignal, currSizeC, cudaMemcpyDeviceToHost));
++	}
++}
++
++/* R2C */
++extern "C" void cuda_plan_r2c_1d_(cufftHandle* plan, int* dim, int* batch) {
++    //    MSG("node,%d,gpu,%d,r2cplan,%x,dim,%d,batch,%d,numel,%d",gprocid,GPUID,plan,*dim,*batch,(*dim)*(*batch));
++	BATCHR2C = *batch;
++    CUFFT_SAFE_CALL_2(cufftPlan1d(plan, *dim, CUFFT_R2C, *batch));
++}
++extern "C" void cuda_plan_r2c_1d_hack_(cufftHandle* plan, int* dim, int* batch) {
++    //    MSG("gpu,%d,r2cplan-hack,%x,dim,%d,batch,%d",GPUID,plan,*dim,*batch);
++    (cufftPlan1d(plan, *dim, CUFFT_R2C, *batch));
++}
++extern "C" void run_fft_r2c_for_(cufftHandle* plan, cufftReal* a, cufftComplex* b, int* Nr, int* Nc) {
++	int NR = *Nr;
++	int NC = *Nc;
++	size_t newSizeR = sizeof(cufftReal) * NR * BATCHR2C;
++	size_t newSizeC = sizeof(cufftComplex) * NC * BATCHR2C;
++	if (newSizeC != currSizeC || newSizeR != currSizeR) {
++		currSizeC = newSizeC;
++		currSizeR = newSizeR;
++		if (d_csignal) { CUDA_SAFE_CALL_2(cudaFree(d_csignal)); }
++		if (d_rsignal) { CUDA_SAFE_CALL_2(cudaFree(d_rsignal)); }
++		CUDA_SAFE_CALL_2(cudaMalloc((void**)&d_rsignal, currSizeR));
++		CUDA_SAFE_CALL_2(cudaMalloc((void**)&d_csignal, currSizeC));
++		CUDA_SAFE_CALL_2(cudaMemcpy(d_rsignal, a, currSizeR, cudaMemcpyHostToDevice));
++		//fft
++		CUFFT_SAFE_CALL_2(cufftExecR2C(*plan, (cufftReal*)d_rsignal, (cufftComplex*)d_csignal));
++		CUDA_SAFE_CALL_2(cudaMemcpy(b, d_csignal, currSizeC, cudaMemcpyDeviceToHost));
++	} else {
++		CUDA_SAFE_CALL_2(cudaMemcpy(d_rsignal, a, currSizeR, cudaMemcpyHostToDevice));
++		//fft
++		CUFFT_SAFE_CALL_2(cufftExecR2C(*plan, (cufftReal*)d_rsignal, (cufftComplex*)d_csignal));
++		CUDA_SAFE_CALL_2(cudaMemcpy(b, d_csignal, currSizeC, cudaMemcpyDeviceToHost));
++	}
++}
++
++/* C2R */
++extern "C" void cuda_plan_c2r_1d_(cufftHandle* plan, int* dim, int* batch) {
++	BATCHC2R = *batch;
++	CUFFT_SAFE_CALL_2(cufftPlan1d(plan, *dim, CUFFT_C2R, *batch));
++}
++extern "C" void run_fft_c2r_for_(cufftHandle* plan, cufftComplex* a, cufftReal* b, int* Nr, int* Nc) {
++	int NR = *Nr;
++	int NC = *Nc;
++	size_t newSizeR = sizeof(cufftReal) * NR * BATCHC2R;
++	size_t newSizeC = sizeof(cufftComplex) * NC * BATCHC2R;
++	if (newSizeC != currSizeC || newSizeR != currSizeR) {
++		currSizeC = newSizeC;
++		currSizeR = newSizeR;
++		if (d_csignal) { CUDA_SAFE_CALL_2(cudaFree(d_csignal)); }
++		if (d_rsignal) { CUDA_SAFE_CALL_2(cudaFree(d_rsignal)); }
++		CUDA_SAFE_CALL_2(cudaMalloc((void**)&d_rsignal, currSizeR));
++		CUDA_SAFE_CALL_2(cudaMalloc((void**)&d_csignal, currSizeC));
++		CUDA_SAFE_CALL_2(cudaMemcpy(d_csignal, a, currSizeC, cudaMemcpyHostToDevice));
++		//fft
++		CUFFT_SAFE_CALL_2(cufftExecC2R(*plan, (cufftComplex*)d_csignal, (cufftReal*)d_rsignal));
++		CUDA_SAFE_CALL_2(cudaMemcpy(b, d_rsignal, currSizeR, cudaMemcpyDeviceToHost));
++	} else {
++		CUDA_SAFE_CALL_2(cudaMemcpy(d_csignal, a, currSizeC, cudaMemcpyHostToDevice));
++		//fft
++		CUFFT_SAFE_CALL_2(cufftExecC2R(*plan, (cufftComplex*)d_csignal, (cufftReal*)d_rsignal));
++		CUDA_SAFE_CALL_2(cudaMemcpy(b, d_rsignal, currSizeR, cudaMemcpyDeviceToHost));
++	}
++}
++
++extern "C" void kill_plan_(cufftHandle* plan) {
++    CUFFT_SAFE_CALL_2(cufftDestroy(*plan));
++}
++
+diff -rupN p3dfft-2.4-orig//build/cufft.F90 p3dfft-2.4//build/cufft.F90
+--- p3dfft-2.4-orig//build/cufft.F90	1969-12-31 19:00:00.000000000 -0500
++++ p3dfft-2.4//build/cufft.F90	2011-03-26 18:46:57.000000000 -0400
+@@ -0,0 +1,133 @@
++!     
++!     Define the INTERFACE to the NVIDIA CUFFT routines
++!     
++
++module precision
++      integer, parameter, public :: Single = kind(1.0) ! Single precision
++      integer, parameter, public :: Double = kind(1.0d0) ! Double precision
++      integer, parameter, public :: fp_kind= kind(1.0)
++end module precision
++
++module cufft
++
++      use precision
++      integer, public :: CUFFT_FORWARD = -1
++      integer, public :: CUFFT_INVERSE = 1
++      integer, public :: CUFFT_R2C = Z'2a' ! Real to Complex (interleaved)
++      integer, public :: CUFFT_C2R = Z'2c' ! Complex (interleaved) to Real
++      integer, public :: CUFFT_C2C = Z'29' ! Complex to Complex, interleaved
++      integer, public :: CUFFT_D2Z = Z'6a' ! Double to Double-Complex
++      integer, public :: CUFFT_Z2D = Z'6c' ! Double-Complex to Double
++      integer, public :: CUFFT_Z2Z = Z'69' ! Double-Complex to Double-Complex
++
++!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++!     
++! cufftPlan1d(cufftHandle *plan, 
++!   int nx,
++!   cufftType type,
++!   int batch)
++!     
++!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++
++      interface cufftPlan1d
++      subroutine cufftPlan1d(plan, nx, type, batch) &
++      bind(C,name='cufftPlan1d')
++      use iso_c_binding
++      integer(c_int):: plan
++      integer(c_int),value:: nx, type, batch
++      end subroutine cufftPlan1d
++      end interface cufftPlan1d
++
++!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++!
++!
++!
++!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++
++      interface cufftPlanMany
++      subroutine cufftPlan1d(plan, rank, nx,&
++                             in, is, id, on, os, od,&
++                             type, batch) &
++      bind(C,name='cufftPlanMany')
++      use iso_c_binding
++      integer(c_int):: plan
++      integer(c_int),value:: rank
++      integer(c_int):: nx, in 
++      integer(c_int),value:: is, id
++      integer(c_int)::  on
++      integer(c_int),value::  os, od, type, batch
++      end subroutine cufftPlan1d
++      end interface cufftPlanMany
++
++
++!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++!
++! cufftDestroy(cufftHandle plan)
++!
++!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++
++      interface cufftDestroy
++      subroutine cufftDestroy(plan) bind(C,name='cufftDestroy')
++      use iso_c_binding
++      integer(c_int),value:: plan
++      end subroutine cufftDestroy
++      end interface cufftDestroy
++
++!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++!     
++! cudaSetDevice(int deviceid)
++!     
++!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++
++      interface cudaSetDevice
++      subroutine cudaSetDevice(deviceid) bind(C,name='cudaSetDevice')
++      use iso_c_binding
++      integer(c_int),value:: deviceid
++      end subroutine cudaSetDevice
++      end interface cudaSetDevice
++
++!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++!
++! cufftExecC2C(cufftHandle plan,
++!   cufftComplex *idata,
++!   cufftComplex *odata,
++!   int direction)
++!
++!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++
++      interface cufftExecC2C
++      subroutine cufftExecC2C(plan, idata, odata, direction) &
++      & bind(C,name='cufftExecC2C')
++      use iso_c_binding
++      use precision
++      integer(c_int),value:: plan
++      complex(fp_kind):: idata(*)
++      complex(fp_kind):: odata(*)
++      integer(c_int),value:: direction
++      end subroutine cufftExecC2C
++      end interface cufftExecC2C
++      
++      interface cufftExecR2C
++      subroutine cufftExecR2C(plan, idata, odata) &
++      & bind(C,name='cufftExecR2C')
++      use iso_c_binding
++      use precision
++      integer(c_int),value:: plan
++      real(fp_kind):: idata(*)
++      complex(fp_kind):: odata(*)
++      end subroutine cufftExecR2C
++      end interface cufftExecR2C
++      
++      interface cufftExecC2R
++      subroutine cufftExecC2R(plan, idata, odata) &
++      & bind(C,name='cufftExecC2R')
++      use iso_c_binding
++      use precision
++      integer(c_int),value:: plan
++      complex(fp_kind):: idata(*)
++      real(fp_kind):: odata(*)
++      end subroutine cufftExecC2R
++      end interface cufftExecC2R
++      
++end module cufft
++
+diff -rupN p3dfft-2.4-orig//build/fft_exec.F90 p3dfft-2.4//build/fft_exec.F90
+--- p3dfft-2.4-orig//build/fft_exec.F90	2010-08-05 18:46:29.000000000 -0400
++++ p3dfft-2.4//build/fft_exec.F90	2011-05-02 21:02:37.335438536 -0400
+@@ -66,16 +66,23 @@
+ 
+       use fft_spec
+       use p3dfft
++      use pfft
+       implicit none
+ 
+       integer stride_x1,stride_x2,stride_y1,stride_y2,N,m
++      integer xw
++      integer ierr
+       complex(mytype) X(N*stride_x1+m*stride_x2),Y(N*stride_y1+m*stride_y2)
+ 
+ #ifdef FFTW
+ #ifndef SINGLE_PREC
+          call dfftw_execute_dft(plan1_bc,X,Y)
+ #else
++#ifndef _CUDA
+          call sfftw_execute_dft(plan1_bc,X,Y)
++#else
++      call ifft_c2c(Y,X,N,m,g_proc_id)  
++#endif
+ #endif
+ #elif defined ESSL
+ 
+@@ -98,16 +105,23 @@
+ 
+       use fft_spec
+       use p3dfft
++      use pfft
+       implicit none
+ 
+       integer stride_x1,stride_x2,stride_y1,stride_y2,N,m
++      integer xw
++      integer ierr
+       complex(mytype) X(N*stride_x1+m*stride_x2),Y(N*stride_y1+m*stride_y2)
+ 
+ #ifdef FFTW
+ #ifndef SINGLE_PREC
+          call dfftw_execute_dft(plan2_bc,X,Y)
+ #else
++#ifndef _CUDA
+          call sfftw_execute_dft(plan2_bc,X,Y)
++#else
++      call ifft_c2c(Y,X,N,m,g_proc_id)
++#endif
+ #endif
+ #elif defined ESSL
+ 
+@@ -131,9 +145,16 @@
+ 
+       use fft_spec
+       use p3dfft
++      use pfft
+       implicit none
+ 
++      include 'mpif.h'
++      character*(MPI_MAX_PROCESSOR_NAME) name
++      integer nlen,numtasks,taskid
++
+       integer dimx,dimy,N,m
++      integer xw,yw
++      integer ierr
+       complex(mytype) X((N/2+1)*m)
+       real(mytype) Y(N*m)
+ 
+@@ -141,9 +162,14 @@
+ #ifndef SINGLE_PREC
+       call dfftw_execute_dft_c2r(plan1_bcr,X,Y)
+ #else
++#ifndef _CUDA
+       call sfftw_execute_dft_c2r(plan1_bcr,X,Y)
++#else
++      xw=(N/2+1)
++      yw=N
++      call fft_c2r(Y,X,yw,xw,m,g_proc_id)
++#endif
+ #endif
+-
+ #elif defined ESSL
+ 
+ #ifndef SINGLE_PREC
+@@ -166,9 +192,12 @@
+ 
+       use fft_spec
+       use p3dfft
++      use pfft
+       implicit none
+ 
+       integer N,m,stride_x1,stride_x2,stride_y1,stride_y2
++      integer xw
++      integer ierr
+       complex(mytype) X(N*stride_x1+m*stride_x2),Y(N*stride_y1+m*stride_y2)
+ 
+ 
+@@ -176,9 +205,12 @@
+ #ifndef SINGLE_PREC
+       call dfftw_execute_dft(plan1_fc,X,Y)
+ #else
++#ifndef _CUDA
+       call sfftw_execute_dft(plan1_fc,X,Y)
++#else
++      call fft_c2c(Y,X,N,m,g_proc_id)  
++#endif
+ #endif
+-
+ #elif defined ESSL
+ 
+ #ifndef SINGLE_PREC
+@@ -199,18 +231,25 @@
+ 
+       use fft_spec
+       use p3dfft
++      use pfft
+       implicit none
+ 
+       integer N,m,stride_x1,stride_x2,stride_y1,stride_y2
++      integer xw,yw
++      integer ierr
+       complex(mytype) X(N*stride_x1+m*stride_x2),Y(N*stride_y1+m*stride_y2)
+ 
+ #ifdef FFTW
+ #ifndef SINGLE_PREC
+       call dfftw_execute_dft(plan2_fc,X,Y)
+ #else
++#ifndef _CUDA
++
+       call sfftw_execute_dft(plan2_fc,X,Y)
++#else
++      call fft_c2c(Y,X,N,m,g_proc_id)    
++#endif
+ #endif
+-
+ #elif defined ESSL
+ 
+ #ifndef SINGLE_PREC
+@@ -233,8 +272,16 @@
+ 
+       use fft_spec
+       use p3dfft
++      use pfft
++      implicit none
++
++      include 'mpif.h'
++      character*(MPI_MAX_PROCESSOR_NAME) name
++      integer nlen,numtasks,taskid
+ 
+       integer dimx,dimy,N,m
++      integer xw,yw
++      integer ierr
+       real(mytype) X(N*m)
+       complex(mytype) Y((N/2+1)*m)
+ 
+@@ -243,9 +290,14 @@
+ #ifndef SINGLE_PREC
+       call dfftw_execute_dft_r2c(plan1_frc,X,Y)
+ #else
++#ifndef _CUDA
+       call sfftw_execute_dft_r2c(plan1_frc,X,Y)
++#else
++      xw=N
++      yw=(N/2+1)
++      call fft_r2c(Y,X,xw,yw,m,g_proc_id)
++#endif
+ #endif
+-
+ #elif defined ESSL
+ 
+ #ifndef SINGLE_PREC
+diff -rupN p3dfft-2.4-orig//build/fft_spec.F90 p3dfft-2.4//build/fft_spec.F90
+--- p3dfft-2.4-orig//build/fft_spec.F90	2010-08-05 18:46:29.000000000 -0400
++++ p3dfft-2.4//build/fft_spec.F90	2011-05-02 21:03:46.225438493 -0400
+@@ -29,6 +29,9 @@
+       include "fftw3.f"
+       integer(SELECTED_INT_KIND(16)) plan1_frc,plan1_bcr,plan1_fc,plan2_fc,plan1_bc,plan2_bc
+ !      integer(i8) plan1,plan2,plan3      
++#ifdef _CUDA
++      integer(SELECTED_INT_KIND(16)) cu_c2c_f1, cu_c2c_b1, cu_c2c_f2, cu_c2c_b2
++#endif
+       integer fftw_flag,NULL
+ #ifdef ESTIMATE
+       parameter(fftw_flag = FFTW_ESTIMATE,NULL=0)
+diff -rupN p3dfft-2.4-orig//build/kind.F90 p3dfft-2.4//build/kind.F90
+--- p3dfft-2.4-orig//build/kind.F90	1969-12-31 19:00:00.000000000 -0500
++++ p3dfft-2.4//build/kind.F90	2011-03-26 18:46:57.000000000 -0400
+@@ -0,0 +1,39 @@
++!     To define a portable way of precision
++!     
++      MODULE kind_module
++!     
++!     Description:
++!     Define kinds for single and double precision in a portable way
++!     
++!     Current Code Owner: Thomas Hauser
++!     
++!     History:
++!     
++!     Version   Date     Comment
++!     -------   ----     -------
++!     1.0       09-03-08 Original code. Thomas Hauser
++!     
++!     Code Description:
++!     Language:           Fortran 90.
++!     Software Standards: "European Standards for Writing and
++!     Documenting Exchangeable Fortran 90 Code".
++!     
++
++      IMPLICIT NONE
++!     Global (i.e. public) Declarations:
++!     Global Parameters:
++!     Symbolic names for kind type of single and double-precision reals:
++!     (with at least 6 and 12 digits of accuracy)
++
++      INTEGER, PARAMETER :: single = SELECTED_REAL_KIND(p=6)
++      INTEGER, PARAMETER :: double = SELECTED_REAL_KIND(p=15)
++      INTEGER, PARAMETER :: prec = single
++
++!     Symbolic names for kind type of single and double-precision complex:
++
++      INTEGER, PARAMETER :: cSingle = KIND((1.0_single,1.0_single))
++      INTEGER, PARAMETER :: cDouble = KIND((1.0_double,1.0_double))
++      INTEGER, PARAMETER :: cPrec = cSingle
++
++      END MODULE kind_module
++
+diff -rupN p3dfft-2.4-orig//build/Makefile.am p3dfft-2.4//build/Makefile.am
+--- p3dfft-2.4-orig//build/Makefile.am	2010-08-05 18:46:29.000000000 -0400
++++ p3dfft-2.4//build/Makefile.am	2011-04-03 16:46:52.000000000 -0400
+@@ -1,13 +1,19 @@
+-AM_FCFLAGS = $(FDFLAGS) 
+-INCLUDES = $(FFTW_INC)
+-LDADD = $(FFTW_LIB)
++AM_FCFLAGS = $(FDFLAGS) $(NVCCFLAGS)  
++INCLUDES = $(FFTW_INC) $(NVCCFLAGS) 
++LDADD = $(FFTW_LIB) $(NVCCFLAGS) 
++
+ 
+ lib_LIBRARIES = libp3dfft.a
+ 
+-libp3dfft_a_SOURCES = fft_spec.F90 module.F90 fft_init.F90 fft_exec.F90 wrap.F90
++libp3dfft_a_SOURCES =  cuda.cu kind.F90 fft_spec.F90  pfft.F90 module.F90 fft_init.F90 fft_exec.F90 wrap.F90
++
++cuda:
++
++.cu.o:
++	$(NVCC) $(NVCCFLAGS)  -c -o $@ $<
+ 
+-module.o: setup.F90 init_plan.F90 ftran.F90 btran.F90 reorder.F90 fcomm1.F90 \
+-fcomm2_trans.F90 bcomm1_trans.F90 fcomm2.F90 bcomm1.F90 bcomm2.F90 ghost_cell.F90
++module.o: cuda.cu kind.F90 pfft.F90 setup.F90 init_plan.F90 ftran.F90 btran.F90 reorder.F90 fcomm1.F90 \
++	fcomm2_trans.F90 bcomm1_trans.F90 fcomm2.F90 bcomm1.F90 bcomm2.F90 ghost_cell.F90
+ 
+ all-local:
+ 	-@[ -e "p3dfft.mod" ] && mv -f p3dfft.mod ../include
+diff -rupN p3dfft-2.4-orig//build/Makefile.in p3dfft-2.4//build/Makefile.in
+--- p3dfft-2.4-orig//build/Makefile.in	2010-08-07 13:52:59.000000000 -0400
++++ p3dfft-2.4//build/Makefile.in	2011-04-09 20:36:30.000000000 -0400
+@@ -56,7 +56,8 @@ AR = ar
+ ARFLAGS = cru
+ libp3dfft_a_AR = $(AR) $(ARFLAGS)
+ libp3dfft_a_LIBADD =
+-am_libp3dfft_a_OBJECTS = fft_spec.$(OBJEXT) module.$(OBJEXT) \
++am_libp3dfft_a_OBJECTS = cuda.$(OBJEXT) kind.$(OBJEXT) \
++	fft_spec.$(OBJEXT) pfft.$(OBJEXT) module.$(OBJEXT) \
+ 	fft_init.$(OBJEXT) fft_exec.$(OBJEXT) wrap.$(OBJEXT)
+ libp3dfft_a_OBJECTS = $(am_libp3dfft_a_OBJECTS)
+ DEFAULT_INCLUDES = -I. -I$(srcdir) -I$(top_builddir)
+@@ -105,6 +106,8 @@ LIBOBJS = @LIBOBJS@
+ LIBS = @LIBS@
+ LTLIBOBJS = @LTLIBOBJS@
+ MAKEINFO = @MAKEINFO@
++NVCC = @NVCC@
++NVCCFLAGS = @NVCCFLAGS@
+ OBJEXT = @OBJEXT@
+ PACKAGE = @PACKAGE@
+ PACKAGE_BUGREPORT = @PACKAGE_BUGREPORT@
+@@ -147,15 +150,15 @@ sbindir = @sbindir@
+ sharedstatedir = @sharedstatedir@
+ sysconfdir = @sysconfdir@
+ target_alias = @target_alias@
+-AM_FCFLAGS = $(FDFLAGS) 
+-INCLUDES = $(FFTW_INC)
+-LDADD = $(FFTW_LIB)
++AM_FCFLAGS = $(FDFLAGS) $(NVCCFLAGS)  
++INCLUDES = $(FFTW_INC) $(NVCCFLAGS) 
++LDADD = $(FFTW_LIB) $(NVCCFLAGS) 
+ lib_LIBRARIES = libp3dfft.a
+-libp3dfft_a_SOURCES = fft_spec.F90 module.F90 fft_init.F90 fft_exec.F90 wrap.F90
++libp3dfft_a_SOURCES = cuda.cu kind.F90 fft_spec.F90  pfft.F90 module.F90 fft_init.F90 fft_exec.F90 wrap.F90
+ all: all-am
+ 
+ .SUFFIXES:
+-.SUFFIXES: .F90 .o .obj
++.SUFFIXES: .F90 .cu .o .obj
+ $(srcdir)/Makefile.in:  $(srcdir)/Makefile.am  $(am__configure_deps)
+ 	@for dep in $?; do \
+ 	  case '$(am__configure_deps)' in \
+@@ -398,8 +401,13 @@ uninstall-am: uninstall-info-am uninstal
+ 	uninstall-libLIBRARIES
+ 
+ 
+-module.o: setup.F90 init_plan.F90 ftran.F90 btran.F90 reorder.F90 fcomm1.F90 \
+-fcomm2_trans.F90 bcomm1_trans.F90 fcomm2.F90 bcomm1.F90 bcomm2.F90 ghost_cell.F90
++cuda:
++
++.cu.o:
++	$(NVCC) $(NVCCFLAGS)  -c -o $@ $<
++
++module.o: cuda.cu kind.F90 pfft.F90 setup.F90 init_plan.F90 ftran.F90 btran.F90 reorder.F90 fcomm1.F90 \
++	fcomm2_trans.F90 bcomm1_trans.F90 fcomm2.F90 bcomm1.F90 bcomm2.F90 ghost_cell.F90
+ 
+ all-local:
+ 	-@[ -e "p3dfft.mod" ] && mv -f p3dfft.mod ../include
+diff -rupN p3dfft-2.4-orig//build/module.F90 p3dfft-2.4//build/module.F90
+--- p3dfft-2.4-orig//build/module.F90	2010-08-09 19:02:26.000000000 -0400
++++ p3dfft-2.4//build/module.F90	2011-05-02 21:04:52.405438452 -0400
+@@ -57,6 +57,7 @@
+       integer,save ::jistart,kjstart,jisize,kjsize,jiend,kjend
+ 
+       integer,save ::  nxh,nxhp
++      integer,save,public ::  g_proc_id
+ 
+ ! mpi process info
+ !
+diff -rupN p3dfft-2.4-orig//build/pfft.F90 p3dfft-2.4//build/pfft.F90
+--- p3dfft-2.4-orig//build/pfft.F90	1969-12-31 19:00:00.000000000 -0500
++++ p3dfft-2.4//build/pfft.F90	2011-04-03 16:46:52.000000000 -0400
+@@ -0,0 +1,133 @@
++!%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
++!
++!This module is a wrapper to be used for calculating FFTs on the GPU.
++!
++!%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
++module pfft
++  use kind_module
++  use fft_spec
++  use, intrinsic :: ISO_C_Binding, only: C_int, C_ptr, C_NULL_ptr
++  implicit none
++  integer, parameter,public :: mytype2=KIND(1.0)
++  contains
++
++  subroutine fft_c2c(signal_out, signal_in, n, batch, proc_id)
++      implicit none
++      integer, intent(in):: batch
++      integer, intent(in):: proc_id
++      complex(mytype2), intent(in), dimension(0:n*batch-1)::signal_in
++      complex(mytype2), intent(out), dimension(0:n*batch-1)::signal_out
++      integer, intent(in)::n
++      integer :: plan_b
++      call cuda_set_device(proc_id)
++      call cuda_plan_c2c_1d(plan_b,n,batch)
++      call run_fft_c2c_for(plan_b,signal_in,signal_out,n)
++      call kill_plan(plan_b)
++  end subroutine fft_c2c
++
++  subroutine ifft_c2c(signal_out, signal_in, n, batch, proc_id)
++      implicit none
++      integer, intent(in):: batch
++      integer, intent(in):: proc_id
++      complex(mytype2), intent(in), dimension(0:n*batch-1)::signal_in
++      complex(mytype2), intent(out), dimension(0:n*batch-1)::signal_out
++      integer, intent(in)::n
++      integer :: plan_b
++      call cuda_set_device(proc_id)
++      call cuda_plan_c2c_1d(plan_b,n,batch)
++      call run_fft_c2c_back(plan_b,signal_in,signal_out,n)
++      call kill_plan(plan_b)
++  end subroutine ifft_c2c
++
++!   subroutine fft_c2c_1(signal_out, signal_in, n, batch, proc_id)
++!      implicit none
++!      integer, intent(in):: batch
++!      integer, intent(in):: proc_id
++!      complex(mytype2), intent(in), dimension(0:n*batch-1)::signal_in
++!      complex(mytype2), intent(out), dimension(0:n*batch-1)::signal_out
++!      integer, intent(in)::n
++!      call cuda_set_device(proc_id)
++!      call run_fft_c2c_for(cu_c2c_f1,signal_in,signal_out,n)
++!    end subroutine fft_c2c_1
++
++!    subroutine ifft_c2c_1(signal_out, signal_in, n, batch, proc_id)
++!      implicit none
++!      integer, intent(in):: batch
++!      integer, intent(in):: proc_id
++!      complex(mytype2), intent(in), dimension(0:n*batch-1)::signal_in
++!      complex(mytype2), intent(out), dimension(0:n*batch-1)::signal_out
++!      integer, intent(in)::n
++!      call cuda_set_device(proc_id)
++!      call run_fft_c2c_back(cu_c2c_b1,signal_in,signal_out,n)
++!    end subroutine ifft_c2c_1
++
++!   subroutine fft_c2c_2(signal_out, signal_in, n, batch, proc_id)
++!      implicit none
++!      integer, intent(in):: batch
++!      integer, intent(in):: proc_id
++!      complex(mytype2), intent(in), dimension(0:n*batch-1)::signal_in
++!      complex(mytype2), intent(out), dimension(0:n*batch-1)::signal_out
++!      integer, intent(in)::n
++!      call cuda_set_device(proc_id)
++!      call run_fft_c2c_for(cu_c2c_f2,signal_in,signal_out,n)
++!    end subroutine fft_c2c_2
++
++!    subroutine ifft_c2c_2(signal_out, signal_in, n, batch, proc_id)
++!      implicit none
++!      integer, intent(in):: batch
++!      integer, intent(in):: proc_id
++!      complex(mytype2), intent(in), dimension(0:n*batch-1)::signal_in
++!      complex(mytype2), intent(out), dimension(0:n*batch-1)::signal_out
++!      integer, intent(in)::n
++!      call cuda_set_device(proc_id)
++!      call run_fft_c2c_back(cu_c2c_b2,signal_in,signal_out,n)
++!    end subroutine ifft_c2c_2
++
++  subroutine fft_r2c(signal_out, signal_in, nr, nc, batch, proc_id)
++     implicit none
++     integer, intent(in):: batch
++     integer, intent(in):: proc_id
++     real(mytype2), intent(in), dimension(0:nr*batch-1)::signal_in
++     complex(mytype2), intent(out), dimension(0:nc*batch-1)::signal_out
++     integer, intent(in)::nr
++     integer, intent(in)::nc
++     integer :: plan_b
++     call cuda_set_device(proc_id)
++     call cuda_plan_r2c_1d(plan_b,nr,batch)
++     call run_fft_r2c_for(plan_b,signal_in,signal_out,nr,nc)
++     call kill_plan(plan_b)
++   end subroutine fft_r2c
++
++  subroutine fft_c2r(signal_out, signal_in, nr, nc, batch, proc_id)
++     implicit none
++     integer, intent(in):: batch
++     integer, intent(in):: proc_id
++     complex(mytype2), intent(in), dimension(0:nc*batch-1)::signal_in
++     real(mytype2), intent(out), dimension(0:nr*batch-1)::signal_out
++     integer, intent(in)::nr
++     integer, intent(in)::nc
++     integer :: plan_b
++     call cuda_set_device(proc_id)
++     call cuda_plan_c2r_1d(plan_b,nr,batch)
++     call run_fft_c2r_for(plan_b,signal_in,signal_out,nr,nc)
++     call kill_plan(plan_b)
++   end subroutine fft_c2r
++
++   subroutine fft_set_device(deviceid)
++      implicit none
++      integer, intent(in):: deviceid
++      call cuda_set_device(deviceid)
++   end subroutine fft_set_device
++
++   subroutine fft_plan_r2c_temp()
++      implicit none
++      !      integer :: plan_b
++      integer(C_int) :: plan_b
++      call cuda_plan_r2c_1d_hack(plan_b,4,1)
++      call kill_plan(plan_b)
++   end subroutine fft_plan_r2c_temp
++
++   
++end module pfft
++
++
+diff -rupN p3dfft-2.4-orig//build/setup.F90 p3dfft-2.4//build/setup.F90
+--- p3dfft-2.4-orig//build/setup.F90	2010-08-05 18:46:29.000000000 -0400
++++ p3dfft-2.4//build/setup.F90	2011-05-02 21:06:07.215438406 -0400
+@@ -26,6 +26,7 @@
+ ! =========================================================
+       subroutine p3dfft_setup(dims,nx,ny,nz,overwrite)
+ !========================================================
++      use pfft
+ 
+       implicit none
+ 
+@@ -62,6 +63,14 @@
+       call MPI_COMM_SIZE (MPI_COMM_WORLD,numtasks,ierr)
+       call MPI_COMM_RANK (MPI_COMM_WORLD,taskid,ierr)
+ 
++#ifdef _CUDA
++      ! cuda init
++      call MPI_COMM_RANK(MPI_COMM_WORLD,g_proc_id,ierr)
++      call fft_set_device(g_proc_id)
++      ! cufft init
++      call fft_plan_r2c_temp()
++#endif
++
+       if(dims(1) .le. 0 .or. dims(2) .le. 0 .or.  dims(1)*dims(2) .ne. numtasks) then
+          print *,'Invalid processor geometry: ',dims,' for ',numtasks, 'tasks'
+          call abort
+diff -rupN p3dfft-2.4-orig//ChangeLog p3dfft-2.4//ChangeLog
+--- p3dfft-2.4-orig//ChangeLog	2010-08-05 18:46:27.000000000 -0400
++++ p3dfft-2.4//ChangeLog	2011-04-26 22:02:34.000000000 -0400
+@@ -0,0 +1 @@
++CUDA/CUFFT SUPPORT by Chris McClanahan
+diff -rupN p3dfft-2.4-orig//config.h.in p3dfft-2.4//config.h.in
+--- p3dfft-2.4-orig//config.h.in	2010-08-07 13:52:58.000000000 -0400
++++ p3dfft-2.4//config.h.in	2011-03-26 18:46:57.000000000 -0400
+@@ -109,5 +109,8 @@
+ /* Version number of package */
+ #undef VERSION
+ 
++/* Defined if CUDA should be used */
++#undef _CUDA
++
+ /* Define to rpl_malloc if the replacement function should be used. */
+ #undef malloc
+diff -rupN p3dfft-2.4-orig//configure.ac p3dfft-2.4//configure.ac
+--- p3dfft-2.4-orig//configure.ac	2010-08-07 13:52:53.000000000 -0400
++++ p3dfft-2.4//configure.ac	2011-03-26 18:46:57.000000000 -0400
+@@ -2,7 +2,7 @@
+ # Process this file with autoconf to produce a configure script.
+ 
+ AC_PREREQ(2.59)
+-AC_INIT(P3DFFT, 2.4, dmitry@sdsc.edu)
++AC_INIT([P3DFFT],[2.4],[dmitry@sdsc.edu])
+ AM_INIT_AUTOMAKE(no-dependencies)
+ AC_CONFIG_SRCDIR([build/module.F90])
+ AC_CONFIG_HEADER([config.h])
+@@ -15,7 +15,7 @@ AC_DEFINE_UNQUOTED([CONFIGURE_ARGS],["$a
+ 
+ # check whether to compile using IBM
+ AC_MSG_CHECKING([whether to use IBM compiler])
+-AC_ARG_ENABLE(ibm, [AC_HELP_STRING([--enable-ibm], [compile P3DFFT using IBM compiler])], enableibm=$enableval, enableibm=no)
++AC_ARG_ENABLE(ibm, [AS_HELP_STRING(--enable-ibm,compile P3DFFT using IBM compiler)], enableibm=$enableval, enableibm=no)
+ AC_MSG_RESULT([$enableibm])
+ if test "$enableibm" = "yes"; then
+         AC_DEFINE(IBM, 1, [Define if you want to compile P3DFFT using IBM compiler])
+@@ -26,7 +26,7 @@ fi
+ 
+ # check whether to compile using Intel
+ AC_MSG_CHECKING([whether to use Intel compiler])
+-AC_ARG_ENABLE(intel, [AC_HELP_STRING([--enable-intel], [compile P3DFFT using Intel compiler])], ok=$enableval, ok=no)
++AC_ARG_ENABLE(intel, [AS_HELP_STRING(--enable-intel,compile P3DFFT using Intel compiler)], ok=$enableval, ok=no)
+ AC_MSG_RESULT([$ok])
+ if test "$ok" = "yes"; then
+         AC_DEFINE(INTEL, 1, [Define if you want to compile P3DFFT using Intel compiler])
+@@ -36,7 +36,7 @@ fi
+ 
+ # check whether to compile using PGI
+ AC_MSG_CHECKING([whether to use PGI compiler])
+-AC_ARG_ENABLE(pgi, [AC_HELP_STRING([--enable-pgi], [compile P3DFFT using PGI compiler])], ok=$enableval, ok=no)
++AC_ARG_ENABLE(pgi, [AS_HELP_STRING(--enable-pgi,compile P3DFFT using PGI compiler)], ok=$enableval, ok=no)
+ AC_MSG_RESULT([$ok])
+ if test "$ok" = "yes"; then
+ 	AC_SUBST(LDFLAGS,"$LDFLAGS -pgf90libs")
+@@ -47,7 +47,7 @@ fi
+ 
+ # check whether to compile using GCC
+ AC_MSG_CHECKING([whether to use GCC compiler])
+-AC_ARG_ENABLE(gcc, [AC_HELP_STRING([--enable-gcc], [compile P3DFFT using GCC compiler])], ok=$enableval, ok=no)
++AC_ARG_ENABLE(gcc, [AS_HELP_STRING(--enable-gcc,compile P3DFFT using GCC compiler)], ok=$enableval, ok=no)
+ AC_MSG_RESULT([$ok])
+ if test "$ok" = "yes"; then
+         AC_DEFINE(GCC, 1, [Define if you want to compile P3DFFT using GCC compiler])
+@@ -57,7 +57,7 @@ fi
+ 
+ # check whether to enable single precision
+ AC_MSG_CHECKING([whether to enable single precision])
+-AC_ARG_ENABLE(single, [AC_HELP_STRING([--enable-single], [compile P3DFFT in single precision (default is double precision)])], spval=$enableval, spval=no)
++AC_ARG_ENABLE(single, [AS_HELP_STRING(--enable-single,compile P3DFFT in single precision (default is double precision))], spval=$enableval, spval=no)
+ AC_MSG_RESULT([$spval])
+ if test "$spval" = "yes"; then
+ 	AC_DEFINE(SINGLE_PREC, 1, [Define if you want to compile P3DFFT in single precision])
+@@ -67,7 +67,7 @@ fi
+ 
+ # check whether to enable 1D decomposition
+ AC_MSG_CHECKING([whether to enable 1D decomposition])
+-AC_ARG_ENABLE(oned, [AC_HELP_STRING([--enable-oned], [for 1D decomposition (default is 2D but it can be made 1D through setting up grid 1 x n when running the code) ])], ok=$enableval, ok=no)
++AC_ARG_ENABLE(oned, [AS_HELP_STRING(--enable-oned,for 1D decomposition (default is 2D but it can be made 1D through setting up grid 1 x n when running the code) )], ok=$enableval, ok=no)
+ AC_MSG_RESULT([$ok])
+ if test "$ok" = "yes"; then
+         AC_DEFINE(ONED, 1, [Define if you want 1D decomposition])
+@@ -77,7 +77,7 @@ fi
+ 
+ # check whether to enable estimation
+ AC_MSG_CHECKING([whether to enable estimation])
+-AC_ARG_ENABLE(estimate, [AC_HELP_STRING([--enable-estimate], [If this argument is passed, the FFTW library will not use run-time tuning to select the fastest algorithm for computing FFTs (this option only goes with --enable-fftw) .])], ok=$enableval, ok=no)
++AC_ARG_ENABLE(estimate, [AS_HELP_STRING(--enable-estimate,If this argument is passed, the FFTW library will not use run-time tuning to select the fastest algorithm for computing FFTs (this option only goes with --enable-fftw) .)], ok=$enableval, ok=no)
+ AC_MSG_RESULT([$ok])
+ if test "$ok" = "yes"; then
+         AC_DEFINE(ESTIMATE, 1, [Define whether you want to enable estimation])
+@@ -87,7 +87,7 @@ fi
+ 
+ # check whether to enable the measure algorithm
+ AC_MSG_CHECKING([whether to enable the measure algorithm])
+-AC_ARG_ENABLE(measure, [AC_HELP_STRING([--enable-measure], [for search-once-for-the-fast-algorithm (takes more time on p3dfft_setup()); this option only goes with --enable-fftw.])], ok=$enableval, ok=yes)
++AC_ARG_ENABLE(measure, [AS_HELP_STRING(--enable-measure,for search-once-for-the-fast-algorithm (takes more time on p3dfft_setup()); this option only goes with --enable-fftw.)], ok=$enableval, ok=yes)
+ AC_MSG_RESULT([$ok])
+ if test "$ok" = "yes"; then
+         AC_DEFINE(MEASURE, 1, [Define if you want to enable the measure algorithm])
+@@ -97,7 +97,7 @@ fi
+ 
+ # check whether to enable the patient algorithm
+ AC_MSG_CHECKING([whehter to enable the patient algorithm])
+-AC_ARG_ENABLE(patient, [AC_HELP_STRING([--enable-patient], [for search-once-for-the-fastest-algorithm (takes much more time on p3dfft_setup()); this option only goes with --enable-fftw.])], ok=$enableval, ok=no)
++AC_ARG_ENABLE(patient, [AS_HELP_STRING(--enable-patient,for search-once-for-the-fastest-algorithm (takes much more time on p3dfft_setup()); this option only goes with --enable-fftw.)], ok=$enableval, ok=no)
+ AC_MSG_RESULT([$ok])
+ if test "$ok" = "yes"; then
+         AC_DEFINE(PATIENT, 1, [Define if you want to enable the patient algorithm])
+@@ -107,7 +107,7 @@ fi
+ 
+ # check whether to enable C convention for processor dimensions
+ AC_MSG_CHECKING([whether to enable C convention for processor dimensions])
+-AC_ARG_ENABLE(dimsc, [AC_HELP_STRING([--enable-dimsc], [to assign processor rows and columns according to C convention, rather than "Fortran", which is default.])], ok=$enableval, ok=no)
++AC_ARG_ENABLE(dimsc, [AS_HELP_STRING(--enable-dimsc,to assign processor rows and columns according to C convention, rather than "Fortran", which is default.)], ok=$enableval, ok=no)
+ AC_MSG_RESULT([$ok])
+ if test "$ok" = "yes"; then
+         AC_DEFINE(DIMS_C, 1, [Define if you want to enable C convention for processor dimensions])
+@@ -117,7 +117,7 @@ fi
+ 
+ # check whether to use MPI_Alltoall instead of MPI_Alltotallv
+ AC_MSG_CHECKING([whether to use MPI_Alltoall instead of MPI_Alltotallv])
+-AC_ARG_ENABLE(useeven, [AC_HELP_STRING([--enable-useeven], [for using MPI_Alltoall instead of MPI_Alltotallv. This method pads the send buffers with zeros to make them equal size. This options is not needed on most architectures.])], ok=$enableval, ok=no)
++AC_ARG_ENABLE(useeven, [AS_HELP_STRING(--enable-useeven,for using MPI_Alltoall instead of MPI_Alltotallv. This method pads the send buffers with zeros to make them equal size. This options is not needed on most architectures.)], ok=$enableval, ok=no)
+ AC_MSG_RESULT([$ok])
+ if test "$ok" = "yes"; then
+         AC_DEFINE(USE_EVEN, 1, [Define if you want to MPI_Alltoall instead of MPI_Alltotallv])
+@@ -127,7 +127,7 @@ fi
+ 
+ # check whether to enable stride-1 data structures
+ AC_MSG_CHECKING([whether to enable stride-1 data structures])
+-AC_ARG_ENABLE(stride1, [AC_HELP_STRING([--enable-stride1], [to enable stride-1 data structures on output (this may in some cases give some advantage in performance). You can define loop blocking factors NBL_X and NBL_Y to experiment, otherwise they are set to default values.])], ok=$enableval, ok=no)
++AC_ARG_ENABLE(stride1, [AS_HELP_STRING(--enable-stride1,to enable stride-1 data structures on output (this may in some cases give some advantage in performance). You can define loop blocking factors NBL_X and NBL_Y to experiment, otherwise they are set to default values.)], ok=$enableval, ok=no)
+ AC_MSG_RESULT([$ok])
+ if test "$ok" = "yes"; then
+         AC_DEFINE(STRIDE1, 1, [Define if you want to enable stride-1 data structures])
+@@ -137,7 +137,7 @@ fi
+ 
+ # check whether to override default value of the NBL_X
+ AC_MSG_CHECKING([whether to override default value of NBL_X])
+-AC_ARG_ENABLE(nblx, [AC_HELP_STRING([--enable-nblx], [to define loop blocking factor NBL_X])], nblval=$enableval, nblval="")
++AC_ARG_ENABLE(nblx, [AS_HELP_STRING(--enable-nblx,to define loop blocking factor NBL_X)], nblval=$enableval, nblval="")
+ if test "$nblval" != ""; then
+         AC_MSG_RESULT([yes])
+         AC_DEFINE(NBL_X, $nblval, [Define if you want to override the default value of NBL_X]) 
+@@ -149,7 +149,7 @@ fi
+ 
+ # check whether to override default value of NBL_Y
+ AC_MSG_CHECKING([whether to override the default value of NBL_Y])
+-AC_ARG_ENABLE(nbly, [AC_HELP_STRING([--enable-nbly], [to define loop blocking factor NBL_Y])], nblval=$enableval, nblval="")
++AC_ARG_ENABLE(nbly, [AS_HELP_STRING(--enable-nbly,to define loop blocking factor NBL_Y)], nblval=$enableval, nblval="")
+ if test "$nblval" != ""; then
+         AC_MSG_RESULT([yes])
+         AC_DEFINE(NBL_Y, $nblval, [Define if you want to override the default value of NBL_Y])
+@@ -161,7 +161,7 @@ fi
+ 
+ # check whether to use OpenMP
+ # AC_MSG_CHECKING([whether to use OpenMP library])
+-# AC_ARG_ENABLE(openmp, [AC_HELP_STRING([--enable-openmp], [for using the OpenMP library (disabled by default)])], ok=$enableval, ok=no)
++# AC_ARG_ENABLE(openmp, [AS_HELP_STRING(--enable-openmp,for using the OpenMP library (disabled by default))], ok=$enableval, ok=no)
+ # AC_MSG_RESULT([$ok])
+ # if test "$ok" = "yes"; then
+ #       AC_DEFINE(OPENMP, 1, [Define if you want to use the OpenMP library])
+@@ -171,7 +171,7 @@ fi
+ 
+ # check whether to use FFTW
+ AC_MSG_CHECKING([whether to use FFTW library])
+-AC_ARG_ENABLE(fftw, [AC_HELP_STRING([--enable-fftw], [for using the FFTW library])], fftwval=$enableval, fftwval=no)
++AC_ARG_ENABLE(fftw, [AS_HELP_STRING(--enable-fftw,for using the FFTW library)], fftwval=$enableval, fftwval=no)
+ AC_MSG_RESULT([$fftwval])
+ if test "$fftwval" = "yes"; then
+         AC_DEFINE(FFTW, 1, [Define if you want to use the FFTW library])
+@@ -181,7 +181,7 @@ fi
+ 
+ # check whether to use ESSL
+ AC_MSG_CHECKING([whether to use ESSL library])
+-AC_ARG_ENABLE(essl, [AC_HELP_STRING([--enable-essl], [for using ESSL (on IBM) in 1D FFTs.])], esslval=$enableval, esslval=no)
++AC_ARG_ENABLE(essl, [AS_HELP_STRING(--enable-essl,for using ESSL (on IBM) in 1D FFTs.)], esslval=$enableval, esslval=no)
+ AC_MSG_RESULT([$esslval])
+ if test "$esslval" = "yes"; then
+         AC_DEFINE(ESSL, 1, [Define if you want to use the ESSL library instead of FFTW])
+@@ -202,7 +202,7 @@ fi
+ 
+ # check for fftw3
+ AC_MSG_CHECKING([FFTW directory])
+-AC_ARG_WITH(fftw, [AC_HELP_STRING([--with-fftw], [path to location of FFTW library])], withfftw=$withval, withfftw="")
++AC_ARG_WITH(fftw, [AS_HELP_STRING(--with-fftw,path to location of FFTW library)], withfftw=$withval, withfftw="")
+ if test "$withfftw" != "yes" && test "$withfftw" != ""; then
+ 	AC_MSG_RESULT([$withfftw])
+ 	if test -e [$withfftw/lib/libfftw3.a ]; then
+@@ -222,6 +222,62 @@ else
+ 	fi
+ fi
+ 
++
++#=========================================================
++
++# ------------------------------------------------------------------------------
++# Setup CUDA paths
++# ------------------------------------------------------------------------------
++#CUDA_INSTALL_PATH="/usr/local/cuda-3.2" #HACK!Lincoln@NSCA!
++#CUDA_SDK_INSTALL_PATH="/usr/local/NVIDIA_GPU_Computing_SDK-3.2" #HACK!Lincoln@NCSA!
++CUDA_INSTALL_PATH="/sw/keeneland/cuda/3.2/linux_binary" #HACK!keeneland!
++CUDA_SDK_INSTALL_PATH="/nics/b/home/mcclanah/NVIDIA_GPU_Computing_SDK" #HACK!keeneland!
++
++AC_MSG_CHECKING([whether to use CUDA library])
++AC_ARG_ENABLE(cuda,
++   [AS_HELP_STRING(--enable-cuda,enable CUDA support)],
++   cudaval="yes",
++   cudaval="no")
++AC_MSG_RESULT([$cudaval])
++
++# check to see if CUDA been selected
++if test "$cudaval" == "no"; then
++   AC_MSG_WARN([Not using CUDA!])
++fi
++
++AC_ARG_WITH([cuda],
++   [AS_HELP_STRING([--with-cuda=PATH],[prefix where CUDA is installed @<:@default=auto@:>@])],
++   [CUDA_INSTALL_PATH=$withval],
++   [with_cuda=auto])
++
++AC_ARG_WITH([cuda-sdk],
++   [AS_HELP_STRING([--with-cuda-sdk=PATH],[prefix where CUDA SDK is installed @<:@default=auto@:>@])],
++   [CUDA_SDK_INSTALL_PATH=$withval],
++   [with_cuda_sdk=auto])
++ 
++
++# ------------------------------------------------------------------------------
++# Setup nvcc flags
++# ------------------------------------------------------------------------------
++if test  "$cudaval" = "yes"; then
++   NVCCFLAGS="$NVCCFLAGS"
++   CUDA_CFLAGS="$CUDA_CFLAGS"
++   CUDA_CFLAGS="$CUDA_CFLAGS -I$CUDA_SDK_INSTALL_PATH/C/common/inc/"
++   CUDA_CFLAGS="$CUDA_CFLAGS -I$CUDA_INSTALL_PATH/include"
++   CUDA_LDFLAGS="-L$CUDA_INSTALL_PATH/lib64"
++   CUDA_LIBS="-lcuda -lcudart -lcufft"
++   NVCCFLAGS="$NVCCFLAGS $CUDA_CFLAGS $CUDA_LDFLAGS $CUDA_LIBS"
++   NVCC="nvcc"
++   AC_SUBST(NVCC)
++   AC_SUBST(NVCCFLAGS)
++   AC_DEFINE([_CUDA],[1],[Defined if CUDA should be used])
++   eval "ARRAY${N}='-D_CUDA'"
++   N=`expr $N + 1`
++fi
++
++#=========================================================
++
++
+ # construct compiler flags
+ N=`expr $N - 1`
+ TMP0=
+@@ -275,7 +331,7 @@ AC_CONFIG_FILES([Makefile
+ 	 	 sample/FORTRAN/Makefile])
+ 
+ AC_SUBST(TESTLIBS, $TESTLIBS)
+-AC_OUTPUT()
++AC_OUTPUT
+ cp config.h include/config.h
+ AC_MSG_NOTICE([configure script complete!])
+ 
+diff -rupN p3dfft-2.4-orig//Makefile.am p3dfft-2.4//Makefile.am
+--- p3dfft-2.4-orig//Makefile.am	2010-08-09 19:10:31.000000000 -0400
++++ p3dfft-2.4//Makefile.am	2011-03-26 18:46:57.000000000 -0400
+@@ -2,7 +2,8 @@ EXTRA_DIST = NEWS README AUTHORS ChangeL
+ 		build/bcomm1.F90 build/bcomm1_trans.F90 build/bcomm2.F90 \
+ 		build/btran.F90 build/fcomm1.F90 build/fcomm2.F90 \
+ 		build/fcomm2_trans.F90 build/ftran.F90 build/ghost_cell.F90 \
+-		build/init_plan.F90 build/reorder.F90 build/setup.F90 
++		build/init_plan.F90 build/reorder.F90 build/setup.F90 \
++		build/cufft.F90
+ 
+ include_HEADERS = include/p3dfft.h 
+ 
+@@ -10,7 +11,8 @@ SUBDIRS = \
+ 	build \
+ 	sample
+ 
+-all-local: 
++all-local:
+ 	echo $(SUCCESS)
++
+ clean-local:
+ 	-test -z "include/p3dfft.mod" || rm -f include/p3dfft.mod
+diff -rupN p3dfft-2.4-orig//Makefile.in p3dfft-2.4//Makefile.in
+--- p3dfft-2.4-orig//Makefile.in	2010-08-09 19:10:38.000000000 -0400
++++ p3dfft-2.4//Makefile.in	2011-03-26 18:46:57.000000000 -0400
+@@ -114,6 +114,8 @@ LIBOBJS = @LIBOBJS@
+ LIBS = @LIBS@
+ LTLIBOBJS = @LTLIBOBJS@
+ MAKEINFO = @MAKEINFO@
++NVCC = @NVCC@
++NVCCFLAGS = @NVCCFLAGS@
+ OBJEXT = @OBJEXT@
+ PACKAGE = @PACKAGE@
+ PACKAGE_BUGREPORT = @PACKAGE_BUGREPORT@
+@@ -160,7 +162,8 @@ EXTRA_DIST = NEWS README AUTHORS ChangeL
+ 		build/bcomm1.F90 build/bcomm1_trans.F90 build/bcomm2.F90 \
+ 		build/btran.F90 build/fcomm1.F90 build/fcomm2.F90 \
+ 		build/fcomm2_trans.F90 build/ftran.F90 build/ghost_cell.F90 \
+-		build/init_plan.F90 build/reorder.F90 build/setup.F90 
++		build/init_plan.F90 build/reorder.F90 build/setup.F90 \
++		build/cufft.F90
+ 
+ include_HEADERS = include/p3dfft.h 
+ SUBDIRS = \
+@@ -417,7 +420,7 @@ distdir: $(DISTFILES)
+ 	      || exit 1; \
+ 	  fi; \
+ 	done
+-	-find $(distdir) -type d ! -perm -777 -exec chmod a+rwx {} \; -o \
++	-find $(distdir) -type d ! -perm -755 -exec chmod a+rwx,go+rx {} \; -o \
+ 	  ! -type d ! -perm -444 -links 1 -exec chmod a+r {} \; -o \
+ 	  ! -type d ! -perm -400 -exec chmod a+r {} \; -o \
+ 	  ! -type d ! -perm -444 -exec $(SHELL) $(install_sh) -c -m a+r {} {} \; \
+@@ -614,8 +617,9 @@ uninstall-info: uninstall-info-recursive
+ 	uninstall-includeHEADERS uninstall-info-am
+ 
+ 
+-all-local: 
++all-local:
+ 	echo $(SUCCESS)
++
+ clean-local:
+ 	-test -z "include/p3dfft.mod" || rm -f include/p3dfft.mod
+ # Tell versions [3.59,3.63) of GNU make to not export all variables.
+diff -rupN p3dfft-2.4-orig//README p3dfft-2.4//README
+--- p3dfft-2.4-orig//README	2010-08-05 22:23:20.000000000 -0400
++++ p3dfft-2.4//README	2011-04-26 21:59:45.000000000 -0400
+@@ -1,3 +1,19 @@
++========================================
++CUDA COMPILE INFO
++========================================
++  Keeneland:
++    ./configure --enable-intel --enable-fftw --with-fftw="$FFTW_HOME"
++    FCFLAGS="-O3 -fpp -reentrancy -132" CFLAGS="-O3 -fpp -reentrancy -132"
++    LDFLAGS="-lmpi_f90 -lmpi_f77 -limf" FC=mpif90 --enable-single
++    --enable-stride1 --enable-cuda
++
++  Lincoln:
++    ./configure --enable-intel --enable-fftw --with-fftw="$FFTW_HOME"
++    FCFLAGS="-O3 -132 -fpp -reentrancy" CFLAGS="-O3 -132 -fpp -reentrancy"
++    LDFLAGS="-lmpich -limf" FC=mpif90 --enable-single --enable-stride1
++    --enable-cuda
++========================================
++
+ 
+ P3DFFT - Highly scalable parallel 3D Fast Fourier Transforms library
+ 
+diff -rupN p3dfft-2.4-orig//sample/C/Makefile.in p3dfft-2.4//sample/C/Makefile.in
+--- p3dfft-2.4-orig//sample/C/Makefile.in	2010-08-07 13:52:59.000000000 -0400
++++ p3dfft-2.4//sample/C/Makefile.in	2011-03-26 18:46:55.000000000 -0400
+@@ -125,6 +125,8 @@ LIBOBJS = @LIBOBJS@
+ LIBS = @LIBS@
+ LTLIBOBJS = @LTLIBOBJS@
+ MAKEINFO = @MAKEINFO@
++NVCC = @NVCC@
++NVCCFLAGS = @NVCCFLAGS@
+ OBJEXT = @OBJEXT@
+ PACKAGE = @PACKAGE@
+ PACKAGE_BUGREPORT = @PACKAGE_BUGREPORT@
+diff -rupN p3dfft-2.4-orig//sample/FORTRAN/driver_rand.F90 p3dfft-2.4//sample/FORTRAN/driver_rand.F90
+--- p3dfft-2.4-orig//sample/FORTRAN/driver_rand.F90	2010-08-09 19:02:26.000000000 -0400
++++ p3dfft-2.4//sample/FORTRAN/driver_rand.F90	2011-03-26 18:46:56.000000000 -0400
+@@ -46,11 +46,14 @@
+ !
+ ! If you have questions please contact Dmitry Pekurovsky, dmitry@sdsc.edu
+ 
++!#define PRINTARRAY
++
+       program fft3d
+ 
+       use p3dfft
+       implicit none
+-      include 'mpif.h'
++      include &
++      'mpif.h'
+ 
+       integer i,n,nx,ny,nz
+       integer m,x,y,z
+@@ -65,13 +68,18 @@
+       real(mytype) factor
+       real(mytype),dimension(:),allocatable:: sinx,siny,sinz
+       real(r8) rtime1,rtime2,Nglob,prec
+-      real(r8) gt(10,3),gtcomm(3),tc
++      real(r8) gt(12,3),gtcomm(3),tc
+       integer ierr,nu,ndim,dims(2),nproc,proc_id
+       integer istart(3),iend(3),isize(3)
+       integer fstart(3),fend(3),fsize(3)
+       integer iproc,jproc
+       logical iex
+ 
++      CHARACTER(LEN=30) :: arg_str
++      INTEGER arg_num
++      arg_num = 0
++      ierr = 0
++
+       call MPI_INIT (ierr)
+       call MPI_COMM_SIZE (MPI_COMM_WORLD,nproc,ierr)
+       call MPI_COMM_RANK (MPI_COMM_WORLD,proc_id,ierr)
+@@ -84,16 +92,30 @@
+       gtcomm = 0.0
+ 
+       if (proc_id.eq.0) then 
+-         open (unit=3,file='stdin',status='old', &
+-               access='sequential',form='formatted', iostat=fstatus)
++
++!        command line arguments
++!
++         arg_num = iargc()
++         call getarg(1, arg_str)
++         print *, arg_str
++         if (arg_num.eq.0) then
++            arg_str='stdin'
++         endif
++         
++!        read
++!
++         open (unit=3,file=arg_str,status='old', &
++         access='sequential',form='formatted', iostat=fstatus)
+          if (fstatus .eq. 0) then
+             write(*, *) ' Reading from input file stdin'
+          endif 
+          ndim = 2
+ 
++!        set
++!
+         read (3,*) nx, ny, nz, ndim,n
+         write (*,*) "procs=",nproc," nx=",nx, &
+-                " ny=", ny," nz=", nz,"ndim=",ndim," repeat=", n
++         " ny=", ny," nz=", nz,"ndim=",ndim," repeat=", n
+         if(mytype .eq. 4) then
+            print *,'Single precision version'
+         else if(mytype .eq. 8) then
+@@ -194,10 +216,19 @@
+       Ntot = fsize(1)*fsize(2)*fsize(3)
+       rtime1 = 0.0               
+       do  m=1,n
++         
+          if(proc_id .eq. 0) then
+             print *,'Iteration ',m
+          endif
+ 
++! PRINT ==============================================
++#ifdef PRINTARRAY
++          if(proc_id .eq. 0) then
++              print *,'Input before forward transform:'
++              call print_all_real(BEG,Ntot,proc_id,Nglob)
++          endif
++#endif
++
+ ! Barrier for correct timing
+          call MPI_Barrier(MPI_COMM_WORLD,ierr)
+ ! Forward transform
+@@ -206,19 +237,17 @@
+          
+          rtime1 = rtime1 + MPI_wtime()
+ 
+-         if(proc_id .eq. 0) then
+-            print *,'Result of forward transform:'
+-            call print_all(AEND,Ntot,proc_id,Nglob)
+-         endif
++! PRINT ==============================================
++#ifdef PRINTARRAY
++          if(proc_id .eq. 0) then
++              print *,'Result of forward transform:'
++              call print_all(AEND,Ntot,proc_id,Nglob)
++          endif
++#endif
+ 
+ ! Normalize
+          call mult_array(AEND, Ntot,factor)
+          
+-!        if(proc_id .eq. 0) then
+-!            print *,'Result of forward transform:'
+-!       call print_all(AEND,Ntot,proc_id,Nglob)
+-!    endif
+-
+ ! Barrier for correct timing
+          call MPI_Barrier(MPI_COMM_WORLD,ierr)
+ ! Backward transform
+@@ -226,10 +255,13 @@
+          call p3dfft_btran_c2r (AEND,FIN)       
+          rtime1 = rtime1 + MPI_wtime()
+ 
+-!         if(proc_id .eq. 0) then
+-!            print *,'Result of backward transform:'
+-!            call print_all_real(FIN,Ntot,proc_id,Nglob)
+-!         endif
++! PRINT ==============================================
++#ifdef PRINTARRAY
++          if(proc_id .eq. 0) then
++             print *,'Result of backward transform:'
++             call print_all_real(FIN,Ntot,proc_id,Nglob)
++          endif
++#endif
+          
+       end do
+ 
+@@ -277,13 +309,13 @@
+ 
+       timers = timers / dble(n)
+ 
+-      call MPI_Reduce(timers,gt(1,1),10,mpi_real8,MPI_SUM,0, &
++      call MPI_Reduce(timers,gt(1,1),12,mpi_real8,MPI_SUM,0, &
+         MPI_COMM_WORLD,ierr)
+ 
+-      call MPI_Reduce(timers,gt(1,2),10,mpi_real8,MPI_MAX,0, &
++      call MPI_Reduce(timers,gt(1,2),12,mpi_real8,MPI_MAX,0, &
+         MPI_COMM_WORLD,ierr)
+ 
+-      call MPI_Reduce(timers,gt(1,3),10,mpi_real8,MPI_MIN,0, &
++      call MPI_Reduce(timers,gt(1,3),12,mpi_real8,MPI_MIN,0, &
+         MPI_COMM_WORLD,ierr)
+ 
+       tc = (timers(1)+timers(2)+timers(3)+timers(4))
+@@ -294,14 +326,16 @@
+       call MPI_Reduce(tc,gtcomm(3),1,mpi_real8,MPI_MIN,0, &
+         MPI_COMM_WORLD,ierr)
+ 
+-      gt(1:10,1) = gt(1:10,1) / dble(nproc)
++      gt(1:12,1) = gt(1:12,1) / dble(nproc)
+       gtcomm(1) = gtcomm(1) / dble(nproc)
+ 
+       if(proc_id .eq. 0) then
+-         do i=1,10
+-            print *,'timer',i,' (avg/max/min): ',gt(i,:)
++         do i=1,12
++            print *,'timer',i,' (avg/max/min): '
++            print *,' ',gt(i,:)
+          enddo
+-         print *,'Total comm (avg/max/min): ',gtcomm
++         print *,'Total comm (avg/max/min): '
++         print *,' ',gtcomm
+       endif
+ 
+       call MPI_FINALIZE (ierr)
+diff -rupN p3dfft-2.4-orig//sample/FORTRAN/driver_sine.F90 p3dfft-2.4//sample/FORTRAN/driver_sine.F90
+--- p3dfft-2.4-orig//sample/FORTRAN/driver_sine.F90	2010-08-05 18:46:28.000000000 -0400
++++ p3dfft-2.4//sample/FORTRAN/driver_sine.F90	2011-04-26 21:42:44.000000000 -0400
+@@ -46,6 +46,8 @@
+ !
+ ! If you have questions please contact Dmitry Pekurovsky, dmitry@sdsc.edu
+ 
++!#define PRINTARRAY
++
+       program fft3d
+ 
+       use p3dfft
+@@ -65,7 +67,7 @@
+       real(mytype) factor
+       real(mytype),dimension(:),allocatable:: sinx,siny,sinz
+       real(i8) rtime1,rtime2,Nglob,prec
+-      real(i8) gt(10,3),gtcomm(3),tc
++      real(i8) gt(12,3),gtcomm(3),tc
+       integer ierr,nu,ndim,dims(2),nproc,proc_id
+       integer istart(3),iend(3),isize(3)
+       integer fstart(3),fend(3),fsize(3)
+@@ -218,6 +220,14 @@
+             print *,'Iteration ',m
+          endif
+          
++! PRINT ==============================================
++#ifdef PRINTARRAY
++          if(proc_id .eq. 0) then
++              print *,'Input before forward transform:'
++              call print_all_real(BEG,Ntot,proc_id,Nglob)
++          endif
++#endif
++
+ ! Barrier for correct timing
+          call MPI_Barrier(MPI_COMM_WORLD,ierr)
+          rtime1 = rtime1 - MPI_wtime()
+@@ -226,10 +236,13 @@
+          
+          rtime1 = rtime1 + MPI_wtime()
+          
++! PRINT ==============================================
++#ifdef PRINTARRAY
+          if(proc_id .eq. 0) then
+             print *,'Result of forward transform:'
++            call print_all(AEND,Ntot,proc_id,Nglob)
+          endif
+-         call print_all(AEND,Ntot,proc_id,Nglob)
++#endif
+          
+ ! normalize
+          call mult_array(AEND, Ntot,factor)
+@@ -243,6 +256,14 @@
+          
+       end do
+ 
++! PRINT ==============================================
++#ifdef PRINTARRAY
++          if(proc_id .eq. 0) then
++             print *,'Result of backward transform:'
++             call print_all_real(C,Ntot,proc_id,Nglob)
++          endif
++#endif
++
+ ! Free work space
+       call p3dfft_clean
+ 
+@@ -285,13 +306,13 @@
+ 
+       timers = timers / dble(n)
+ 
+-      call MPI_Reduce(timers,gt(1,1),10,mpi_real8,MPI_SUM,0, &
++      call MPI_Reduce(timers,gt(1,1),12,mpi_real8,MPI_SUM,0, &
+         MPI_COMM_WORLD,ierr)
+ 
+-      call MPI_Reduce(timers,gt(1,2),10,mpi_real8,MPI_MAX,0, &
++      call MPI_Reduce(timers,gt(1,2),12,mpi_real8,MPI_MAX,0, &
+         MPI_COMM_WORLD,ierr)
+ 
+-      call MPI_Reduce(timers,gt(1,3),10,mpi_real8,MPI_MIN,0, &
++      call MPI_Reduce(timers,gt(1,3),12,mpi_real8,MPI_MIN,0, &
+         MPI_COMM_WORLD,ierr)
+ 
+       tc = (timers(1)+timers(2)+timers(3)+timers(4))
+@@ -302,11 +323,11 @@
+       call MPI_Reduce(tc,gtcomm(3),1,mpi_real8,MPI_MIN,0, &
+         MPI_COMM_WORLD,ierr)
+ 
+-      gt(1:10,1) = gt(1:10,1) / dble(nproc)
++      gt(1:12,1) = gt(1:12,1) / dble(nproc)
+       gtcomm(1) = gtcomm(1) / dble(nproc)
+ 
+       if(proc_id .eq. 0) then
+-         do i=1,10
++         do i=1,12
+             print *,'timer',i,' (avg/max/min): ',gt(i,:)
+          enddo
+          print *,'Total comm (avg/max/min): ',gtcomm
+@@ -362,4 +383,33 @@
+       return
+       end subroutine
+ 
++
++!=========================================================
++! Translate one-dimensional index into three dimensions,
++!    print out significantly non-zero values
++!
++      subroutine print_all_real(Ar,Nar,proc_id,Nglob)
++
++      use p3dfft
++
++      integer x,y,z,proc_id
++      integer(i8) i,Nar
++      real(r8) Nglob	
++      real(mytype) Ar(1,1,*)
++      integer Fstart(3),Fend(3),Fsize(3)
++
++      call p3dfft_get_dims(Fstart,Fend,Fsize,1)
++      do i=1,Nar
++         if(abs(Ar(1,1,i)) .gt. Nglob *1.25e-8) then
++            z = (i-1)/(Fsize(1)*Fsize(2))
++            y = (i-1 - z * Fsize(1)*Fsize(2))/Fsize(1)
++            x = i-1-z*Fsize(1)*Fsize(2) - y*Fsize(1)
++            print *,'(',x+Fstart(1),y+Fstart(2),z+Fstart(3),') ',Ar(1,1,i)
++         endif
++      enddo
++
++      return
++      end subroutine
++
++
+       end
+diff -rupN p3dfft-2.4-orig//sample/FORTRAN/Makefile.am p3dfft-2.4//sample/FORTRAN/Makefile.am
+--- p3dfft-2.4-orig//sample/FORTRAN/Makefile.am	2010-08-05 18:46:28.000000000 -0400
++++ p3dfft-2.4//sample/FORTRAN/Makefile.am	2011-03-26 18:46:56.000000000 -0400
+@@ -1,9 +1,9 @@
+-AM_FCFLAGS = $(FDFLAGS) $(INCLUDES) 
+-INCLUDES = -I$(top_builddir)/include/
+-LDADD = $(top_builddir)/build/libp3dfft.a $(FFTW_LIB) $(FFTWF) 
++AM_FCFLAGS = $(FDFLAGS) $(INCLUDES) $(NVCCFLAGS) 
++INCLUDES = -I$(top_builddir)/include/ $(NVCCFLAGS)  
++LDADD = $(top_builddir)/build/libp3dfft.a $(FFTW_LIB) $(FFTWF) $(NVCCFLAGS) 
+ 
+ fsampledir = $(datadir)/p3dfft-samples/
+-fsample_PROGRAMS =  test_sine_f.x test_sine_inplace_f.x test_rand_f.x test_spec_f.x test_inverse_f.x
++fsample_PROGRAMS =  test_sine_f.x test_sine_inplace_f.x test_rand_f.x test_spec_f.x 
+ 
+ test_sine_f_x_SOURCES = driver_sine.F90
+ 
+diff -rupN p3dfft-2.4-orig//sample/FORTRAN/Makefile.in p3dfft-2.4//sample/FORTRAN/Makefile.in
+--- p3dfft-2.4-orig//sample/FORTRAN/Makefile.in	2010-08-07 13:52:59.000000000 -0400
++++ p3dfft-2.4//sample/FORTRAN/Makefile.in	2011-03-26 18:46:56.000000000 -0400
+@@ -36,7 +36,7 @@ PRE_UNINSTALL = :
+ POST_UNINSTALL = :
+ fsample_PROGRAMS = test_sine_f.x$(EXEEXT) \
+ 	test_sine_inplace_f.x$(EXEEXT) test_rand_f.x$(EXEEXT) \
+-	test_spec_f.x$(EXEEXT) test_inverse_f.x$(EXEEXT)
++	test_spec_f.x$(EXEEXT)
+ subdir = sample/FORTRAN
+ DIST_COMMON = $(srcdir)/Makefile.am $(srcdir)/Makefile.in
+ ACLOCAL_M4 = $(top_srcdir)/aclocal.m4
+@@ -49,33 +49,31 @@ CONFIG_CLEAN_FILES =
+ am__installdirs = "$(DESTDIR)$(fsampledir)"
+ fsamplePROGRAMS_INSTALL = $(INSTALL_PROGRAM)
+ PROGRAMS = $(fsample_PROGRAMS)
+-am_test_inverse_f_x_OBJECTS = driver_inverse.$(OBJEXT)
+-test_inverse_f_x_OBJECTS = $(am_test_inverse_f_x_OBJECTS)
+-test_inverse_f_x_LDADD = $(LDADD)
+-am__DEPENDENCIES_1 =
+-test_inverse_f_x_DEPENDENCIES = $(top_builddir)/build/libp3dfft.a \
+-	$(am__DEPENDENCIES_1) $(am__DEPENDENCIES_1)
+ am_test_rand_f_x_OBJECTS = driver_rand.$(OBJEXT)
+ test_rand_f_x_OBJECTS = $(am_test_rand_f_x_OBJECTS)
+ test_rand_f_x_LDADD = $(LDADD)
++am__DEPENDENCIES_1 =
+ test_rand_f_x_DEPENDENCIES = $(top_builddir)/build/libp3dfft.a \
+-	$(am__DEPENDENCIES_1) $(am__DEPENDENCIES_1)
++	$(am__DEPENDENCIES_1) $(am__DEPENDENCIES_1) \
++	$(am__DEPENDENCIES_1)
+ am_test_sine_f_x_OBJECTS = driver_sine.$(OBJEXT)
+ test_sine_f_x_OBJECTS = $(am_test_sine_f_x_OBJECTS)
+ test_sine_f_x_LDADD = $(LDADD)
+ test_sine_f_x_DEPENDENCIES = $(top_builddir)/build/libp3dfft.a \
+-	$(am__DEPENDENCIES_1) $(am__DEPENDENCIES_1)
++	$(am__DEPENDENCIES_1) $(am__DEPENDENCIES_1) \
++	$(am__DEPENDENCIES_1)
+ am_test_sine_inplace_f_x_OBJECTS = driver_sine_inplace.$(OBJEXT)
+ test_sine_inplace_f_x_OBJECTS = $(am_test_sine_inplace_f_x_OBJECTS)
+ test_sine_inplace_f_x_LDADD = $(LDADD)
+ test_sine_inplace_f_x_DEPENDENCIES =  \
+ 	$(top_builddir)/build/libp3dfft.a $(am__DEPENDENCIES_1) \
+-	$(am__DEPENDENCIES_1)
++	$(am__DEPENDENCIES_1) $(am__DEPENDENCIES_1)
+ am_test_spec_f_x_OBJECTS = driver_spec.$(OBJEXT)
+ test_spec_f_x_OBJECTS = $(am_test_spec_f_x_OBJECTS)
+ test_spec_f_x_LDADD = $(LDADD)
+ test_spec_f_x_DEPENDENCIES = $(top_builddir)/build/libp3dfft.a \
+-	$(am__DEPENDENCIES_1) $(am__DEPENDENCIES_1)
++	$(am__DEPENDENCIES_1) $(am__DEPENDENCIES_1) \
++	$(am__DEPENDENCIES_1)
+ DEFAULT_INCLUDES = -I. -I$(srcdir) -I$(top_builddir)
+ depcomp =
+ am__depfiles_maybe =
+@@ -84,12 +82,10 @@ PPFCCOMPILE = $(FC) $(DEFS) $(DEFAULT_IN
+ FCLD = $(FC)
+ FCLINK = $(FCLD) $(AM_FCFLAGS) $(FCFLAGS) $(AM_LDFLAGS) $(LDFLAGS) -o \
+ 	$@
+-SOURCES = $(test_inverse_f_x_SOURCES) $(test_rand_f_x_SOURCES) \
+-	$(test_sine_f_x_SOURCES) $(test_sine_inplace_f_x_SOURCES) \
+-	$(test_spec_f_x_SOURCES)
+-DIST_SOURCES = $(test_inverse_f_x_SOURCES) $(test_rand_f_x_SOURCES) \
+-	$(test_sine_f_x_SOURCES) $(test_sine_inplace_f_x_SOURCES) \
+-	$(test_spec_f_x_SOURCES)
++SOURCES = $(test_rand_f_x_SOURCES) $(test_sine_f_x_SOURCES) \
++	$(test_sine_inplace_f_x_SOURCES) $(test_spec_f_x_SOURCES)
++DIST_SOURCES = $(test_rand_f_x_SOURCES) $(test_sine_f_x_SOURCES) \
++	$(test_sine_inplace_f_x_SOURCES) $(test_spec_f_x_SOURCES)
+ ETAGS = etags
+ CTAGS = ctags
+ DISTFILES = $(DIST_COMMON) $(DIST_SOURCES) $(TEXINFOS) $(EXTRA_DIST)
+@@ -126,6 +122,8 @@ LIBOBJS = @LIBOBJS@
+ LIBS = @LIBS@
+ LTLIBOBJS = @LTLIBOBJS@
+ MAKEINFO = @MAKEINFO@
++NVCC = @NVCC@
++NVCCFLAGS = @NVCCFLAGS@
+ OBJEXT = @OBJEXT@
+ PACKAGE = @PACKAGE@
+ PACKAGE_BUGREPORT = @PACKAGE_BUGREPORT@
+@@ -168,9 +166,9 @@ sbindir = @sbindir@
+ sharedstatedir = @sharedstatedir@
+ sysconfdir = @sysconfdir@
+ target_alias = @target_alias@
+-AM_FCFLAGS = $(FDFLAGS) $(INCLUDES) 
+-INCLUDES = -I$(top_builddir)/include/
+-LDADD = $(top_builddir)/build/libp3dfft.a $(FFTW_LIB) $(FFTWF) 
++AM_FCFLAGS = $(FDFLAGS) $(INCLUDES) $(NVCCFLAGS) 
++INCLUDES = -I$(top_builddir)/include/ $(NVCCFLAGS)  
++LDADD = $(top_builddir)/build/libp3dfft.a $(FFTW_LIB) $(FFTWF) $(NVCCFLAGS) 
+ fsampledir = $(datadir)/p3dfft-samples/
+ test_sine_f_x_SOURCES = driver_sine.F90
+ test_inverse_f_x_SOURCES = driver_inverse.F90
+@@ -233,9 +231,6 @@ uninstall-fsamplePROGRAMS:
+ 
+ clean-fsamplePROGRAMS:
+ 	-test -z "$(fsample_PROGRAMS)" || rm -f $(fsample_PROGRAMS)
+-test_inverse_f.x$(EXEEXT): $(test_inverse_f_x_OBJECTS) $(test_inverse_f_x_DEPENDENCIES) 
+-	@rm -f test_inverse_f.x$(EXEEXT)
+-	$(FCLINK) $(test_inverse_f_x_LDFLAGS) $(test_inverse_f_x_OBJECTS) $(test_inverse_f_x_LDADD) $(LIBS)
+ test_rand_f.x$(EXEEXT): $(test_rand_f_x_OBJECTS) $(test_rand_f_x_DEPENDENCIES) 
+ 	@rm -f test_rand_f.x$(EXEEXT)
+ 	$(FCLINK) $(test_rand_f_x_LDFLAGS) $(test_rand_f_x_OBJECTS) $(test_rand_f_x_LDADD) $(LIBS)
+diff -rupN p3dfft-2.4-orig//sample/Makefile.am p3dfft-2.4//sample/Makefile.am
+--- p3dfft-2.4-orig//sample/Makefile.am	2010-08-05 18:46:28.000000000 -0400
++++ p3dfft-2.4//sample/Makefile.am	2011-03-26 18:46:56.000000000 -0400
+@@ -1,3 +1,6 @@
+ SUBDIRS = \
+-	C \
+ 	FORTRAN 
++
++# SUBDIRS = \
++# 	C \
++# 	FORTRAN 
+diff -rupN p3dfft-2.4-orig//sample/Makefile.in p3dfft-2.4//sample/Makefile.in
+--- p3dfft-2.4-orig//sample/Makefile.in	2010-08-07 13:52:59.000000000 -0400
++++ p3dfft-2.4//sample/Makefile.in	2011-03-26 18:46:56.000000000 -0400
+@@ -89,6 +89,8 @@ LIBOBJS = @LIBOBJS@
+ LIBS = @LIBS@
+ LTLIBOBJS = @LTLIBOBJS@
+ MAKEINFO = @MAKEINFO@
++NVCC = @NVCC@
++NVCCFLAGS = @NVCCFLAGS@
+ OBJEXT = @OBJEXT@
+ PACKAGE = @PACKAGE@
+ PACKAGE_BUGREPORT = @PACKAGE_BUGREPORT@
+@@ -132,7 +134,6 @@ sharedstatedir = @sharedstatedir@
+ sysconfdir = @sysconfdir@
+ target_alias = @target_alias@
+ SUBDIRS = \
+-	C \
+ 	FORTRAN 
+ 
+ all: all-recursive
+@@ -432,6 +433,10 @@ uninstall-info: uninstall-info-recursive
+ 	mostlyclean-recursive pdf pdf-am ps ps-am tags tags-recursive \
+ 	uninstall uninstall-am uninstall-info-am
+ 
++
++# SUBDIRS = \
++# 	C \
++# 	FORTRAN 
+ # Tell versions [3.59,3.63) of GNU make to not export all variables.
+ # Otherwise a system limit (for SysV at least) may be exceeded.
+ .NOEXPORT:
