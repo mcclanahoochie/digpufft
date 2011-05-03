@@ -1,0 +1,34 @@
+//////////////////////
+// Chris McClanahan //
+//////////////////////
+
+
+Download and install P3DFFT-2.4
+
+
+Make sure that at least compiles (run a sample program for good measure)
+
+
+Apply the .patch
+
+
+Modify configure.ac variables:
+  CUDA_INSTALL_PATH
+  CUDA_SDK_INSTALL_PATH
+to be correct for your setup
+
+
+Re-run ./configure with new arguments:
+  --enable-cuda
+  --enable-fftw
+  --enable-single 
+  --enable-stride1
+  
+(add those to the end of whatever you used before)
+(For now, those arguments MUST be used to enable CUDA)
+  
+  
+New Makefiles with '-D_CUDA' should have been created, enabling CUFFT acceleration
+
+
+Enjoy!
