@@ -31,4 +31,7 @@ Re-run ./configure with new arguments:
 New Makefiles with '-D_CUDA' should have been created, enabling CUFFT acceleration
 
 
+An example setup script (example-setup.sh) is provided. It shows how to compile and patch p3dfft. Notice that this script is designed specifically for the Keeneland cluster (http://keeneland.gatech.edu/) and will probably need to be tweaked (e.g., different FFTW path, different compiler options) for your own environment.
+
+
 Enjoy!

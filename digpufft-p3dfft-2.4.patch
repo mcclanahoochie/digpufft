@@ -1,7 +1,7 @@
 diff -rupN p3dfft-2.4-orig//build/cuda.cu p3dfft-2.4//build/cuda.cu
 --- p3dfft-2.4-orig//build/cuda.cu	1969-12-31 19:00:00.000000000 -0500
 +++ p3dfft-2.4//build/cuda.cu	2011-04-09 20:36:30.000000000 -0400
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,182 @@
 +#include <stdio.h>
 +#include <cufft.h>
 +#include <cutil.h>
